@@ -71,8 +71,158 @@ These packages are NOT in the webpack client bundle but contribute to `node_modu
 | sillytavern-transformers | 53 MB | ML inference (includes WASM binaries) |
 | tiktoken | 23 MB | OpenAI tokenizer (includes WASM) |
 | protobufjs | 16 MB | Transitive via onnxruntime |
+| @agnai/web-tokenizers | 4.0 MB | Claude/LLaMA tokenization |
+| @agnai/sentencepiece-js | 766 KB | SentencePiece tokenization |
 
 These are the dominant contributors to install size. They include large WASM/binary artifacts that cannot be tree-shaken.
+
+#### Deep Dive: sillytavern-transformers (53 MB)
+
+**What it does:** Provides a Hugging Face Transformers.js-compatible pipeline for running ONNX ML models directly in Node.js via WASM. Used in `src/transformers.js` for five server-side AI tasks:
+
+| Task | Default Model | Purpose |
+|------|--------------|---------|
+| `text-classification` | Cohee/distilbert-base-uncased-go-emotions-onnx | Sentiment/emotion analysis |
+| `image-to-text` | Xenova/vit-gpt2-image-captioning | Image captioning |
+| `feature-extraction` | Xenova/all-mpnet-base-v2 | Text embeddings for vector search |
+| `automatic-speech-recognition` | Xenova/whisper-small | Speech-to-text (Whisper) |
+| `text-to-speech` | Xenova/speecht5_tts | Text-to-speech synthesis |
+
+**Internal breakdown:**
+```
+sillytavern-transformers (53 MB)
+├── dist/ (47 MB)
+│   ├── ort-wasm-simd.wasm          9.6 MB  ← ONNX Runtime WASM (SIMD)
+│   ├── ort-wasm-simd-threaded.wasm 9.5 MB  ← ONNX Runtime WASM (SIMD+threads)
+│   ├── ort-wasm.wasm               8.8 MB  ← ONNX Runtime WASM (baseline)
+│   ├── ort-wasm-threaded.wasm      8.8 MB  ← ONNX Runtime WASM (threads)
+│   ├── transformers.min.js.map     3.6 MB  ← Source map (not needed at runtime)
+│   ├── transformers.js.map         2.4 MB  ← Source map (not needed at runtime)
+│   ├── transformers.js             2.2 MB  ← Main library code
+│   └── transformers.min.js         1.4 MB  ← Minified library code
+├── node_modules/ (4.9 MB)         ← Bundled jimp (older version)
+├── src/ (817 KB)                  ← Source code
+└── types/ (484 KB)                ← TypeScript definitions
+```
+
+**Key issue — 37 MB of duplicated WASM:** The four `ort-wasm-*.wasm` files inside `sillytavern-transformers/dist/` are byte-for-byte identical to those in `onnxruntime-web/dist/`. This is because `sillytavern-transformers` depends on `onnxruntime-web@1.14.0` and also ships its own copies. At runtime, only the copies inside `sillytavern-transformers/dist/` are used (configured explicitly in `src/transformers.js:16`). The `onnxruntime-web` package's 66 MB is effectively dead weight.
+
+**Key issue — 6 MB of source maps:** `transformers.js.map` and `transformers.min.js.map` are development artifacts not needed at runtime.
+
+**Dependencies:** `onnxruntime-web@1.14.0`, `@huggingface/jinja`, `jimp@0.22.10` (bundled older version)
+
+#### Deep Dive: onnxruntime-web (66 MB)
+
+**Not used directly** — purely a transitive dependency of `sillytavern-transformers`. No code in `src/` imports it.
+
+**Internal breakdown:**
+```
+onnxruntime-web (66 MB)
+├── dist/ (63 MB)
+│   ├── 4x WASM files (37 MB total) ← DUPLICATES of those in sillytavern-transformers
+│   ├── ort.js / ort-web.js         ← Multiple JS entry points (3.7-3.8 MB each)
+│   ├── 7x .map files               ← Source maps (~12 MB total)
+│   └── Various minified builds      ← ES5, ES6, WebGL variants
+├── lib/ (2.2 MB)                   ← TypeScript compiled sources
+└── types/ (243 KB)
+```
+
+**The entire 66 MB package could theoretically be eliminated** if `sillytavern-transformers` bundled its own ONNX runtime (which it already does in `dist/`). This would require the upstream package to stop declaring `onnxruntime-web` as a dependency, or using npm overrides to alias it.
+
+#### Deep Dive: tiktoken (23 MB)
+
+**What it does:** OpenAI's BPE tokenizer used to count tokens for GPT models. Used in `src/endpoints/tokenizers.js` via `tiktoken.encoding_for_model(model)` to count tokens before sending requests to OpenAI APIs.
+
+**Internal breakdown:**
+```
+tiktoken (23 MB)
+├── tiktoken_bg.wasm    5.4 MB  ← Core WASM tokenizer engine
+├── encoders/ (17 MB)           ← Token vocabulary files (3x duplication)
+│   ├── o200k_base      2.3 MB × 3 formats (.json, .js, .cjs) = 6.9 MB  ← GPT-4o
+│   ├── cl100k_base     1.1 MB × 3 formats = 3.3 MB                     ← GPT-4/3.5-turbo
+│   ├── p50k_base       534 KB × 3 formats = 1.6 MB                     ← Codex
+│   ├── p50k_edit       534 KB × 3 formats = 1.6 MB                     ← Edit models
+│   ├── r50k_base       533 KB × 3 formats = 1.6 MB                     ← GPT-3
+│   └── gpt2            533 KB × 3 formats = 1.6 MB                     ← GPT-2
+├── lite/ (1.1 MB)              ← Lighter WASM variant
+└── JS/TS files (~200 KB)
+```
+
+**Key issue — 3x format duplication in encoders:** Each encoder vocabulary is shipped in `.json`, `.js`, and `.cjs` formats. Only one format is used at runtime. This triples the encoders directory from ~5.5 MB to ~17 MB.
+
+**Key issue — unused encoders:** If only GPT-3.5-turbo and GPT-4 models are tokenized, only `cl100k_base` and `o200k_base` are needed. The older `r50k_base`, `p50k_*`, and `gpt2` encoders (9.6 MB across all formats) may be unused.
+
+#### Deep Dive: protobufjs (16 MB)
+
+**Not used directly** — transitive dependency of `onnxruntime-web` (itself transitive via `sillytavern-transformers`). Used to deserialize ONNX model protobuf files.
+
+**Internal breakdown:**
+```
+protobufjs (16 MB)
+├── cli/ (13 MB)       ← CLI tools with own node_modules (@babel/parser, lodash, etc.)
+│   └── node_modules/  ← Third copy of lodash (532 KB), @babel/parser (1.4 MB map), etc.
+├── dist/ (2.2 MB)     ← Pre-built bundles
+├── src/ (252 KB)      ← Source code
+└── google/ (59 KB)    ← Proto definitions
+```
+
+**Key issue — 13 MB CLI tools:** The `cli/` directory contains protobuf code generation tools with their own `node_modules` (including yet another copy of lodash). These are only needed for `.proto → .js` compilation, never at runtime.
+
+#### Deep Dive: @agnai/web-tokenizers & sentencepiece-js (4.8 MB)
+
+**What they do:** Provide tokenization for non-OpenAI models (Claude, LLaMA, etc.) in `src/endpoints/tokenizers.js`.
+- `@agnai/web-tokenizers` (4.0 MB): WASM-based tokenizer for Claude and other models using `Tokenizer` class
+- `@agnai/sentencepiece-js` (766 KB): SentencePiece tokenizer for LLaMA-family models
+
+These are relatively lean and well-justified for their functionality.
+
+#### Deep Dive: vectra (323 KB) + transitive deps (~6.5 MB)
+
+**What it does:** Local vector database for similarity search, used in `src/endpoints/vectors.js` to create and query `LocalIndex` instances for character memory/RAG features.
+
+**Transitive dependency bloat:**
+```
+vectra (323 KB) depends on:
+├── openai@3.x (2.0 MB)      ← NOT used by SillyTavern directly
+├── axios (2.4 MB)            ← HTTP client
+├── gpt-3-encoder (1.5 MB)   ← GPT-2 tokenizer (redundant with tiktoken)
+├── cheerio (606 KB)          ← HTML parser
+├── dotenv, uuid, yargs       ← Small utilities
+└── json-colorizer            ← CLI formatting
+```
+
+SillyTavern only uses `vectra.LocalIndex` for local file-based vector storage. The `openai` package (2.0 MB) is declared as a dependency by vectra but is **not used** by SillyTavern (no direct imports). Similarly, `gpt-3-encoder` duplicates functionality already provided by `tiktoken`.
+
+#### AI/ML Dependency Chain Summary
+
+```
+node_modules AI/ML (158 MB + 6.5 MB vectra deps = 164.5 MB)
+│
+├── sillytavern-transformers (53 MB) ← 5 ML tasks via ONNX
+│   ├── 4x WASM files (37 MB) ← DUPLICATED in onnxruntime-web
+│   ├── Source maps (6 MB) ← not needed at runtime
+│   └── onnxruntime-web (66 MB) ← ENTIRELY UNUSED (dead transitive dep)
+│       ├── 4x WASM files (37 MB) ← duplicates
+│       ├── Source maps (12 MB)
+│       └── protobufjs (16 MB)
+│           └── cli/ (13 MB) ← dev tools, not needed at runtime
+│
+├── tiktoken (23 MB) ← OpenAI token counting
+│   ├── WASM engine (5.4 MB)
+│   └── Encoders (17 MB) ← 3x format duplication
+│
+├── @agnai/* (4.8 MB) ← Claude/LLaMA tokenization
+│
+└── vectra (323 KB) + transitive deps (6.5 MB) ← vector search
+    └── openai, gpt-3-encoder, axios, cheerio ← mostly unused
+```
+
+**Total theoretical waste in AI/ML deps: ~98 MB**
+- onnxruntime-web entirely (66 MB): WASM files duplicated, package unused directly
+- protobufjs cli/ (13 MB): dev tools bundled in production
+- tiktoken format duplication (11 MB): 3x .json/.js/.cjs
+- sillytavern-transformers source maps (6 MB): dev artifacts
+- vectra's unused transitive deps (~3.5 MB): openai, gpt-3-encoder
 
 ### Image Processing — 24 MB (7% of node_modules)
 
